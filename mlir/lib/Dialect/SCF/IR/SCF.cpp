@@ -2565,6 +2565,38 @@ struct ConvertTrivialIfToSelect : public OpRewritePattern<IfOp> {
 struct ConditionPropagation : public OpRewritePattern<IfOp> {
   using OpRewritePattern<IfOp>::OpRewritePattern;
 
+  enum class Parent { Then, Else, None };
+
+  static Parent getParentType(Region *toCheck, IfOp op,
+                              DenseMap<Region *, Parent> &cache) {
+    SmallVector<Region *> seen;
+    while (toCheck) {
+      auto found = cache.find(toCheck);
+      if (found != cache.end()) {
+        return found->second;
+      }
+      seen.push_back(toCheck);
+      if (&op.getThenRegion() == toCheck) {
+        for (auto v : seen) {
+          cache[v] = Parent::Then;
+        }
+        return Parent::Then;
+      }
+      if (&op.getElseRegion() == toCheck) {
+        for (auto v : seen) {
+          cache[v] = Parent::Else;
+        }
+        return Parent::Else;
+      }
+      toCheck = toCheck->getParentRegion();
+    }
+
+    for (auto v : seen) {
+      cache[v] = Parent::None;
+    }
+    return Parent::None;
+  }
+
   LogicalResult matchAndRewrite(IfOp op,
                                 PatternRewriter &rewriter) const override {
     // Early exit if the condition is constant since replacing a constant
@@ -2580,9 +2612,11 @@ struct ConditionPropagation : public OpRewritePattern<IfOp> {
     Value constantTrue = nullptr;
     Value constantFalse = nullptr;
 
+    DenseMap<Region *, Parent> cache;
     for (OpOperand &use :
          llvm::make_early_inc_range(op.getCondition().getUses())) {
-      if (op.getThenRegion().isAncestor(use.getOwner()->getParentRegion())) {
+      switch (getParentType(use.getOwner()->getParentRegion(), op, cache)) {
+      case Parent::Then: {
         changed = true;
 
         if (!constantTrue)
@@ -2591,8 +2625,9 @@ struct ConditionPropagation : public OpRewritePattern<IfOp> {
 
         rewriter.modifyOpInPlace(use.getOwner(),
                                  [&]() { use.set(constantTrue); });
-      } else if (op.getElseRegion().isAncestor(
-                     use.getOwner()->getParentRegion())) {
+        break;
+      }
+      case Parent::Else: {
         changed = true;
 
         if (!constantFalse)
@@ -2601,6 +2636,10 @@ struct ConditionPropagation : public OpRewritePattern<IfOp> {
 
         rewriter.modifyOpInPlace(use.getOwner(),
                                  [&]() { use.set(constantFalse); });
+        break;
+      }
+      case Parent::None:
+        break;
       }
     }
 
